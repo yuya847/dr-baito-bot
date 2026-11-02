@@ -1,0 +1,20 @@
+{
+  "name": "dr-baito-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "医師スポットバイトの求人を Google カレンダーの空きと照らし、LINE で秘書のように知らせる",
+  "scripts": {
+    "local": "node src/local.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@aws-sdk/client-cloudformation": "^3.1152.0",
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0",
+    "esbuild": "^0.28.2"
+  },
+  "license": "SEE LICENSE IN LICENSE.md"
+}

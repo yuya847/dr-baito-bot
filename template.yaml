@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  dr-baito-bot — 医師スポットバイトの求人を Google カレンダーの空きと照らし、LINE で秘書のように知らせる。
+  求人は自社の求人データ（JobsFeedUrl）から2分おきに1ページずつ取り込む。鍵は Secrets Manager にだけ置く。
+
+Parameters:
+  Prefs:
+    Type: String
+    Default: '13,14,12,11'
+    Description: 巡回する都道府県コード（JIS、カンマ区切り）。13=東京 14=神奈川 12=千葉 11=埼玉
+  MaxPagesPerPref:
+    Type: Number
+    Default: 30
+  JobsFeedUrl:
+    Type: String
+    Default: ''
+    Description: 求人データの JSON の URL（?pref=&page= を付けて呼ぶ。README の「求人データの形」）。空なら架空の求人で動く
+  JobsLabel:
+    Type: String
+    Default: '自社求人'
+    Description: カードに出す求人の出どころの名前
+  JobHosts:
+    Type: String
+    Default: 'jobs.example.com'
+    Description: カードのリンクにしてよいドメイン（求人ページ・アプリのリンク。カンマ区切り）
+  JobsStatusUrl:
+    Type: String
+    Default: ''
+    Description: 「これまだある？」で掲載状況を聞く URL（{id} を求人 ID に置き換える）。空なら巡回の記録で答える
+  BotName:
+    Type: String
+    Default: '医師バイト秘書'
+    Description: LINE で名乗る名前
+  CrawlHours:
+    Type: String
+    Default: '6-23'
+    Description: 巡回する時間帯（日本時間、cron の時フィールド）
+
+Globals:
+  Function:
+    Environment:
+      Variables:
+        JOBS_LABEL: !Ref JobsLabel
+        JOB_HOSTS: !Ref JobHosts
+        JOBS_STATUS_URL: !Ref JobsStatusUrl
+        BOT_NAME: !Ref BotName
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+
+  Credentials:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: 鍵の置き場（LINE・Claude は scripts/set-line-secret.sh、Google は scripts/google-auth.mjs で入れる。求人データの鍵は JOBS_FEED_TOKEN）
+      SecretString: '{"JOBS_FEED_TOKEN":""}'
+
+  CrawlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: handler.crawl
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: 300
+      # 失敗しても次の2分後の起動で続きから再開するので、Lambda 側の自動再試行はしない
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          SECRET_ID: !Ref Credentials
+          PREFS: !Ref Prefs
+          MAX_PAGES_PER_PREF: !Ref MaxPagesPerPref
+          REQUEST_DELAY_MS: '3000'
+          JOBS_FEED_URL: !Ref JobsFeedUrl
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref Table }
+        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref Credentials }
+      Events:
+        Feed:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Sub 'cron(0/2 ${CrawlHours} * * ? *)'
+            ScheduleExpressionTimezone: Asia/Tokyo
+            Input: '{"site":"feed"}'
+            RetryPolicy: { MaximumRetryAttempts: 0 }
+
+    Metadata:
+      # 必要なコードだけを1ファイルにまとめる（data/ の手元Cookieなどを同梱しない）
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Platform: node
+        Target: node22
+        OutExtension: ['.js=.mjs']
+        EntryPoints: [src/handler.mjs]
+        External: ['@aws-sdk/*']
+        Banner: ['js=import { createRequire } from "module"; const require = createRequire(import.meta.url);']
+
+  CrawlLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${CrawlFunction}'
+      RetentionInDays: 14
+
+  # LINE の受け口（Webhook）。署名を確かめてから処理する
+  LineWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: handler-line.webhook
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      MemorySize: 1024
+      Timeout: 55
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      FunctionUrlConfig:
+        AuthType: NONE
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          SECRET_ID: !Ref Credentials
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref Table }
+        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref Credentials }
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Platform: node
+        Target: node22
+        OutExtension: ['.js=.mjs']
+        EntryPoints: [src/handler-line.mjs]
+        External: ['@aws-sdk/*']
+        Banner: ['js=import { createRequire } from "module"; const require = createRequire(import.meta.url);']
+
+  # 先回りの知らせ（15分おき）。重なり・気にしていた求人の募集終了・増額・新着（3時間に1回）を、変化があるときだけ。送らない時間帯は本人が決める
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: .
+      Handler: handler-line.notify
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      MemorySize: 1024
+      Timeout: 120
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          SECRET_ID: !Ref Credentials
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref Table }
+        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref Credentials }
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: 'cron(0/15 * * * ? *)'
+            ScheduleExpressionTimezone: Asia/Tokyo
+            RetryPolicy: { MaximumRetryAttempts: 0 }
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Platform: node
+        Target: node22
+        OutExtension: ['.js=.mjs']
+        EntryPoints: [src/handler-line.mjs]
+        External: ['@aws-sdk/*']
+        Banner: ['js=import { createRequire } from "module"; const require = createRequire(import.meta.url);']
+
+  LineWebhookLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LineWebhookFunction}'
+      RetentionInDays: 14
+
+  NotifyLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${NotifyFunction}'
+      RetentionInDays: 14
+
+Outputs:
+  TableName:
+    Value: !Ref Table
+  SecretArn:
+    Description: 鍵の置き場（scripts/set-line-secret.sh・google-auth.mjs が書き込む）
+    Value: !Ref Credentials
+  LineWebhookUrl:
+    Description: LINE Developers の Webhook URL に貼る
+    Value: !GetAtt LineWebhookFunctionUrl.FunctionUrl
+  NotifyFunctionName:
+    Value: !Ref NotifyFunction

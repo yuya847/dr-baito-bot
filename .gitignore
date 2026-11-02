@@ -1,0 +1,5 @@
+node_modules/
+.env
+data/
+.aws-sam/
+recon/*.html
